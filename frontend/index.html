@@ -59,10 +59,11 @@ createApp({
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const agg=ref({total:0,writable:0,degraded:0,frozen:0,disabled:0});
+    const allSources=ref([]), aggCard=ref(null), aggEvents=ref([]);
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
     const nav=['到达登记','滞后分级','补齐恢复'];
-    const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
-    const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
+    const disabledSources=computed(()=>allSources.value.filter(s=>s.disabled));
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
@@ -88,6 +89,14 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const g=await loadJson('/api/aggregate'); if(g===null) return;
+      agg.value=g;
+      const al=await loadJson('/api/sources?include_disabled=1'); if(al===null) return;
+      allSources.value=Array.isArray(al.items)?al.items:[];
+      const cd=await loadJson('/api/agg/card'); if(cd===null) return;
+      aggCard.value=cd;
+      const ev=await loadJson('/api/agg/events'); if(ev===null) return;
+      aggEvents.value=Array.isArray(ev.items)?ev.items:[];
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -97,8 +106,10 @@ createApp({
       await refresh();
     }
     async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function doDisable(name){await fetch('/api/sources/'+encodeURIComponent(name)+'/disable',{method:'POST',headers:auth(),body:JSON.stringify({})});await refresh();}
+    async function doEnable(name){await fetch('/api/sources/'+encodeURIComponent(name)+'/enable',{method:'POST',headers:auth(),body:JSON.stringify({})});await refresh();}
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,agg,allSources,disabledSources,aggCard,aggEvents,form,actionErr,modeClass,login,logout,recordArrival,doCatchup,doDisable,doEnable};
   },
   template:`
   <div v-if="!token" class="login">
@@ -122,10 +133,12 @@ createApp({
       <div class="bar">
         <div class="seg"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{n}}</button></div>
       </div>
-      <div class="cards">
-        <div class="card"><h3>源数量</h3><strong>{{sources.length}}</strong></div>
-        <div class="card"><h3>冻结中</h3><strong>{{frozen}}</strong></div>
-        <div class="card"><h3>降级只读</h3><strong>{{degraded}}</strong></div>
+      <div class="cards" style="grid-template-columns:repeat(5,1fr)">
+        <div class="card"><h3>在册源</h3><strong>{{agg.total}}</strong></div>
+        <div class="card"><h3>可写绿灯</h3><strong>{{agg.writable}}</strong></div>
+        <div class="card"><h3>冻结中</h3><strong>{{agg.frozen}}</strong></div>
+        <div class="card"><h3>降级只读</h3><strong>{{agg.degraded}}</strong></div>
+        <div class="card"><h3>已停用</h3><strong>{{agg.disabled}}</strong></div>
       </div>
       <div class="card" v-show="tab===0">
         <h3 style="margin-bottom:8px">登记到达</h3>
@@ -145,17 +158,33 @@ createApp({
       </div>
       <div class="card" v-show="tab===1">
         <h3>分级规则</h3>
-        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
+        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。停用源不进水位聚合，史迹保留。</p>
         <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th></th></tr></thead>
         <tbody><tr v-for="s in sources" :key="'g'+s.id">
           <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
-          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
+          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button>
+              <button class="ghost" style="margin-left:6px" @click="doDisable(s.name)">停用</button></td>
         </tr></tbody></table>
+        <div v-if="disabledSources.length" style="margin-top:14px">
+          <h3>已停用（不进水位聚合，史迹可读）</h3>
+          <table><thead><tr><th>源</th><th>SLA</th><th>状态</th><th></th></tr></thead>
+          <tbody><tr v-for="s in disabledSources" :key="'d'+s.id">
+            <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>停用</td>
+            <td><button class="ghost" @click="doEnable(s.name)">启用回挂</button></td>
+          </tr></tbody></table>
+        </div>
       </div>
       <div class="card" v-show="tab===2">
         <h3>补齐记录</h3>
         <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
         <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <div v-if="aggCard" style="margin-top:14px">
+          <h3>聚合切断卡（当日封档）</h3>
+          <p style="color:#64748b;font-size:13px">{{aggCard.day}} · {{aggCard.method}}路径 · 已封档 · 偏离拒写并记聚合偏了</p>
+          <h3>聚合切断册</h3>
+          <table><thead><tr><th>痕迹</th><th>详情</th><th>时间</th></tr></thead>
+          <tbody><tr v-for="e in aggEvents" :key="'e'+e.id"><td>{{e.kind}}</td><td>{{e.detail}}</td><td>{{e.created_at}}</td></tr></tbody></table>
+        </div>
       </div>
     </main>
   </div>`
